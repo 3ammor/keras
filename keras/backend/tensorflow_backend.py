@@ -470,7 +470,7 @@ def is_keras_tensor(x):
     if not is_tensor(x):
         raise ValueError('Unexpectedly found an instance of type `' +
                          str(type(x)) + '`. '
-                         'Expected a symbolic tensor instance.')
+                                        'Expected a symbolic tensor instance.')
     return hasattr(x, '_keras_history')
 
 
@@ -785,7 +785,12 @@ def zeros_like(x, dtype=None, name=None):
                [ 0.,  0.,  0.]], dtype=float32)
     ```
     """
-    return tf.zeros_like(x, dtype=dtype, name=name)
+    dtype = dtype or x.dtype.base_dtype.name
+    tf_dtype = tf.as_dtype(dtype)
+    v = tf.zeros_like(x, dtype=dtype, name=name)
+    if py_all(v.get_shape().as_list()):
+        return variable(v, dtype=dtype, name=name)
+    return v
 
 
 def ones_like(x, dtype=None, name=None):
@@ -810,7 +815,11 @@ def ones_like(x, dtype=None, name=None):
                [ 1.,  1.,  1.]], dtype=float32)
     ```
     """
-    return tf.ones_like(x, dtype=dtype, name=name)
+    return (
+        None
+        if x is None
+        else
+        (x if x.dtype.base_dtype.name == dtype else tf.cast(x, dtype)))
 
 
 def identity(x, name=None):
@@ -953,6 +962,18 @@ def cast(x, dtype):
     ```
     """
     return tf.cast(x, dtype)
+
+
+def cast_like(x, y):
+    """Casts a tensor to the type of another tensor and returns it
+    You can cast a Keras variable but it still returns a Keras tensor.
+    # Arguments
+        x: Keras tensor (or variable) to be cast
+        y: Keras tensor with the target dtype
+    # Returns
+        x cast to the dtype of y. None if x is None
+    """
+    return None if x is None else cast(x, dtype(y))
 
 
 # UPDATES OPS
@@ -1724,11 +1745,16 @@ def _regular_normalize_batch_in_training(x, gamma, beta,
     # Returns
         A tuple length of 3, `(normalized_tensor, mean, variance)`.
     """
-    mean, var = tf.nn.moments(x, reduction_axes,
+    weight_dtype = 'float32' if dtype(x) == 'float16' else dtype(x)
+    # If x is float16, tf.nn.moments will cast it to float32 to calculate mean
+    # and var and then cast them back down to float16. We want to return them
+    # from this function in float32 so that we can use the full resolution to
+    # update our moving averages. So we cast x to float32 before passing it in.
+    # then cast back down to float16. We want to leave them in float32
+    mean, var = tf.nn.moments(cast(x, weight_dtype), reduction_axes,
                               None, None, False)
-    normed = tf.nn.batch_normalization(x, mean, var,
-                                       beta, gamma,
-                                       epsilon)
+
+    normed = batch_normalization(x, mean, var, beta, gamma, epsilon)
     return normed, mean, var
 
 
@@ -1747,8 +1773,16 @@ def _broadcast_normalize_batch_in_training(x, gamma, beta,
     # Returns
         A tuple length of 3, `(normalized_tensor, mean, variance)`.
     """
-    mean, var = tf.nn.moments(x, reduction_axes,
+    weight_dtype = 'float32' if dtype(x) == 'float16' else dtype(x)
+    # If x is float16, tf.nn.moments will cast it to float32 to calculate mean
+    # and var and then cast them back down to float16. We want to return them
+    # from this function in float32 so that we can use the full resolution to
+    # update our moving averages. So we cast x to float32 before passing it in.
+    # then cast back down to float16. We want to leave them in float32
+    mean, var = tf.nn.moments(cast(x, weight_dtype),
+                              reduction_axes,
                               None, None, False)
+
     target_shape = []
     for axis in range(ndim(x)):
         if axis in reduction_axes:
@@ -1768,7 +1802,7 @@ def _broadcast_normalize_batch_in_training(x, gamma, beta,
     else:
         broadcast_beta = tf.reshape(beta, target_shape)
 
-    normed = tf.nn.batch_normalization(
+    normed = batch_normalization(
         x,
         broadcast_mean,
         broadcast_var,
@@ -1800,13 +1834,14 @@ def _fused_normalize_batch_in_training(x, gamma, beta, reduction_axes,
         normalization_axis = 1
         tf_data_format = 'NCHW'
 
+    weight_dtype = 'float32' if dtype(x) == 'float16' else dtype(x)
     if gamma is None:
         gamma = tf.constant(1.0,
-                            dtype=x.dtype,
+                            dtype=weight_dtype,
                             shape=[x.get_shape()[normalization_axis]])
     if beta is None:
         beta = tf.constant(0.0,
-                           dtype=x.dtype,
+                           dtype=weight_dtype,
                            shape=[x.get_shape()[normalization_axis]])
 
     return tf.nn.fused_batch_norm(
@@ -1906,7 +1941,12 @@ def batch_normalization(x, mean, var, beta, gamma, axis=-1, epsilon=1e-3):
             )
             return y
     # default
-    return tf.nn.batch_normalization(x, mean, var, beta, gamma, epsilon)
+    return tf.nn.batch_normalization(x,
+                                     cast_like(mean, x),
+                                     cast_like(var, x),
+                                     cast_like(beta, x),
+                                     cast_like(gamma, x),
+                                     epsilon)
 
 
 # SHAPE OPERATIONS
@@ -3021,7 +3061,7 @@ def switch(condition, then_expression, else_expression):
                              ' equal to rank of `then_expression` and '
                              '`else_expression`. ndim(condition)=' +
                              str(cond_ndim) + ', ndim(then_expression)'
-                             '=' + str(expr_ndim))
+                                              '=' + str(expr_ndim))
         if cond_ndim > 1:
             ndim_diff = expr_ndim - cond_ndim
             cond_shape = tf.concat([tf.shape(condition), [1] * ndim_diff], axis=0)
@@ -3996,7 +4036,7 @@ def bias_add(x, bias, data_format=None):
             if len(bias_shape) == 1:
                 x += reshape(bias, (1, 1, bias_shape[0]))
             else:
-                x += reshape(bias, (1, ) + bias_shape)
+                x += reshape(bias, (1,) + bias_shape)
     else:
         x = tf.nn.bias_add(x, bias)
     return x
